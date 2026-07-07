@@ -17,7 +17,6 @@ the test set.
   to RMSLE on raw counts. `numpy.expm1()` is only needed to inspect real counts during EDA.
 - **Data span:** December 2017 – November 2018.
 
-See [`data/README.md`](data/README.md) for the full column schema.
 
 ## Repo structure
 
@@ -25,86 +24,65 @@ See [`data/README.md`](data/README.md) for the full column schema.
 .
 ├── README.md
 ├── requirements.txt
-├── data/
-│   └── README.md              # schema + instructions to fetch train/test.csv from Kaggle
-├── notebooks/
-│   ├── 01_baseline_linear_regression.ipynb
-│   ├── 02_ridge_feature_engineering.ipynb
-│   └── 03_ridge_polynomial_features.ipynb
-└── submissions/
-    ├── submission1.csv
-    ├── submission2.csv        # produced by 01_baseline_linear_regression.ipynb
-    ├── submission3.csv
-    ├── submission4.csv        # produced by 02_ridge_feature_engineering.ipynb
-    ├── submission5.csv        
-    └── submission6.csv        # produced by 03_ridge_polynomial_features.ipynb (see Known Issues)
+├── notebook/
+│   └── submission.ipynb
 ```
 
 ## Approach
 
-| # | Notebook | Model | Key idea | Local val. RMSE |
-|---|---|---|---|---|
-| 1 | `01_baseline_linear_regression.ipynb` | `LinearRegression` | Numeric columns only, categorical columns dropped, random 80/20 split | **0.9585** |
-| 2 | `02_ridge_feature_engineering.ipynb` | `Ridge(alpha=10)` | Full feature engineering pass (below) + `StandardScaler`, chronological 80/20 split | **0.7880** |
-| 3 | `03_ridge_polynomial_features.ipynb` | `Ridge(alpha=10)` | Same as #2 + squared terms for `Temperature`, `Humidity`, `Wind speed`, `Rainfall`, `Snowfall` | **0.7880** |
+1. **Load & inspect :** `train.csv` / `test.csv` loaded; a quick check confirms `Seasons` is disjoint
+   between splits — train covers Winter/Spring/Summer, test is entirely Autumn.
+2. **Correlation scan :** Pearson correlation of each raw numeric column against the (log1p) target to
+   sanity-check signal direction before modeling — `Temperature`, `Dew point temperature`, and `Hour`
+   come out strongest.
+3. **EDA :** Mean demand by hour, demand on functioning vs. non-functioning days (confirms
+   non-functioning days have exactly zero demand — a hard rule, not a soft trend), and a boxplot of
+   demand distribution per hour.
+4. **Feature engineering :** (`preprocess_data`), applied identically to train and test:
+   - **Calendar:** `Month`, `DayOfWeek`, `IsWeekend` parsed from `Date`
+   - **Cyclical encodings:** `hour_sin`/`hour_cos`, `month_sin`/`month_cos`
+   - **Rush-hour flags:** `is_morning_rush`, `is_evening_rush`, `is_rush_hour`
+   - **Weather flags & interactions:** `rain_flag`, `snow_flag`, `bad_weather`, `rush_x_bad_weather`,
+     `rush_x_temp`, `temp_comfortable`
+   - **Categorical → binary:** `functioning_day_flag`, `is_holiday`, one-hot season flags
+   - **Polynomial terms (new vs. the prior notebook):** `Temp_sq`, `Humidity_sq`, `Wind_sq`, `Rain_sq`,
+     `Snow_sq` — manually squared versions of five raw columns
+   - Raw `Id`, `Date`, `Holiday`, `Functioning Day`, `Hour`, `Month`, `DayOfWeek`, `Seasons` dropped
+     once their engineered replacements exist
+5. **Chronological 80/20 split :** (`X.iloc[:split]` / `X.iloc[split:]`) rather than a random split —
+   appropriate for hourly time-series data, since a random split would let the model "see the future"
+   via adjacent hours leaking into training.
+6. **Scaling :** `StandardScaler` fit on the training fold only, then applied to validation and test —
+   necessary because Ridge's penalty is scale-sensitive (an unscaled feature with large magnitude is
+   penalized less per unit of predictive power than a small-magnitude one).
+7. **Model :** `Ridge(alpha=10)` fit on scaled training data. Local validation RMSE: **0.7880**.
+8. **Interpretation :** Coefficient magnitudes ranked to identify influential features
+   (`functioning_day_flag`, `hour_sin`, `bad_weather` top the list).
+9. **Refit on full data** with a fresh scaler (`scaler_final`) and generate test predictions
+   (`ridge_final`) — correct practice in isolation.
+10. **Post-processing :** Predictions for `Functioning Day == No` rows are hard-clamped to `0`.
+11. **Export** 
 
+## Concepts used
 
-### Feature engineering (notebooks 02 & 03)
+| Concept | Why it's here |
+|---|---|
+| **Ridge regression (L2 regularization)** | Shrinks coefficients toward zero to reduce variance/overfitting, especially useful with many correlated engineered features |
+| **Feature standardization** | Puts all features on comparable scale so the L2 penalty treats them fairly |
+| **Cyclical (sin/cos) encoding** | Encodes periodic variables (hour, month) so e.g. hour 23 and hour 0 are numerically adjacent instead of maximally far apart |
+| **Interaction features** | Manually crafted terms (`rush_x_temp`, `rush_x_bad_weather`) let a linear model approximate conditional effects it can't otherwise express |
+| **Polynomial (quadratic) features** | Squared terms let a linear model fit curvature (e.g. demand peaking at moderate temperature, not increasing linearly forever) |
+| **Chronological train/validation split** | Avoids the optimistic bias of random splits on temporally ordered data |
+| **Domain-rule post-processing** | Encodes a known deterministic fact (system closed ⇒ demand is 0) directly, rather than hoping the model learns it |
 
-Starting from the baseline's 9 raw numeric columns, the following were engineered:
-
-- **Calendar:** `Month`, `DayOfWeek`, `IsWeekend` parsed from `Date`
-- **Cyclical encodings:** `hour_sin`/`hour_cos`, `month_sin`/`month_cos` (so hour 23 and hour 0 are
-  treated as adjacent, not maximally distant)
-- **Rush-hour flags:** `is_morning_rush` (7–9), `is_evening_rush` (17–19), `is_rush_hour`
-- **Weather flags & interactions:** `rain_flag`, `snow_flag`, `bad_weather`, `rush_x_bad_weather`,
-  `rush_x_temp`, `temp_comfortable` (10–25 °C)
-- **Categoricals → binary flags:** `is_holiday`, `functioning_day_flag`, one-hot season flags
-  (`is_summer`, `is_winter`, `is_spring`, `is_autumn`)
-- **Post-processing:** predictions for rows where `Functioning Day == No` are hard-clamped to `0`, since
-  the system genuinely cannot rent bikes on those hours (confirmed in EDA — 100% of non-functioning-day
-  training rows have zero demand)
-
-### Top features by |coefficient| (Ridge, notebook 02)
+### Top features by |coefficient| 
 
 `functioning_day_flag` > `hour_sin` > `bad_weather` > `snow_flag` > `Humidity(%)` > `Dew point
 temperature(°C)` > `is_morning_rush` > `Temperature(°C)`. This confirms the domain hypothesis that
 operational status, time-of-day cyclicality, and adverse weather dominate demand.
 
-## Known issues / lessons learned
-
-- **`submission5.csv` is broken.** The final cell of `03_ridge_polynomial_features.ipynb` calls
-  `model.predict(X_test)` on the **raw, unscaled** test features using the `Ridge` object fit earlier on
-  **scaled** training data (`X_train_sc`), instead of the correctly-scaled `ridge_final` / `X_test_sc`
-  pair computed two cells earlier. This produces wildly out-of-range predictions (roughly −7400 to −190
-  on the log scale). It's kept in the repo as-is for transparency and as a reminder to always predict
-  with the same preprocessing pipeline used at fit time — ideally by wrapping scaler + model in a single
-  `sklearn.pipeline.Pipeline` so this class of bug becomes structurally impossible.
-- **Polynomial terms added zero value on top of Ridge** (#2 vs #3 tie at 0.7880 RMSE). Squared terms
-  alone don't capture the actual nonlinearity in this data (e.g. the rush-hour × weather interactions
-  already engineered manually).
-- **Train/test have disjoint seasons** — train covers Winter/Spring/Summer, test is entirely Autumn. Any
-  model relying too heavily on season one-hot flags risks not generalizing; cyclical month/hour encodings
-  are more robust here.
-
-## Setup & running
-
-```bash
-git clone <this-repo-url>
-cd <repo-name>
-python -m venv .venv && source .venv/bin/activate    # optional but recommended
-pip install -r requirements.txt
-
-# then, per data/README.md:
-# download train.csv, test.csv, sample_submission.csv from the Kaggle Data tab into data/
-
-jupyter notebook notebooks/01_baseline_linear_regression.ipynb
-```
-
-Each notebook is self-contained end-to-end: load data → EDA → preprocess → train → validate → generate
-`submission.csv` in Kaggle's required `Id,Rented_Bike_Count` format.
 
 ## License
 
 Code in this repository is provided under the MIT License. The competition dataset itself is licensed
-CC BY-NC-SA 4.0 by the host and is **not redistributed** here — see [`data/README.md`](data/README.md).
+CC BY-NC-SA 4.0 by the host and is **not redistributed** here.
